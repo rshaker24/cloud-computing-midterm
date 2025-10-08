@@ -4,57 +4,69 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
+using Microsoft.Extensions.Configuration;
 
 namespace Company.Function;
 
-public class game_api
+public class Game_api
 {
-    private readonly ILogger<game_api> _logger;
+    private readonly ILogger<Game_api> _logger;
 
-    private static readonly List<GameModel> _games = new();
-    private static int _nextId = 1;
-    private const string ApiKey = "api-key"; // TODO: move to config
+    private static readonly List<GameModel> gamesList = new();
+    private readonly string _apiKey;
 
-    public game_api(ILogger<game_api> logger)
+
+    public Game_api(ILogger<Game_api> logger, IConfiguration config)
     {
         _logger = logger;
+        _apiKey = config["API_KEY"] ?? throw new Exception("API_KEY is missing");
     }
 
-    
+
     private bool IsAuthorized(HttpRequest req)
     {
         if (!req.Headers.TryGetValue("x-api-key", out var key)) return false;
-        return key == ApiKey;
+        return key == _apiKey;
     }
-    
+
 
     [Function("game_api")]
     public async Task<IActionResult> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", "put", "delete")] HttpRequest req)
     {
         _logger.LogInformation("C# HTTP trigger function processed a request.");
 
-        
+        // Check for API key
         if (!IsAuthorized(req))
         {
-            return new UnauthorizedResult();
+            return new ObjectResult(new { error = "API Key is Invalid or missing" })
+            {
+                StatusCode = StatusCodes.Status401Unauthorized
+            };
         }
 
         switch (req.Method)
         {
 
             case "GET": //get list of all games
-                return new OkObjectResult(_games);
+                return new OkObjectResult(gamesList);
 
             case "POST": //create a new game
                 {
+                    //Read JSON data
                     using var reader = new StreamReader(req.Body);
                     var body = await reader.ReadToEndAsync();
 
                     var newGame = JsonSerializer.Deserialize<GameModel>(body);
                     if (newGame == null)
                         return new BadRequestObjectResult("Invalid game data");
-                    newGame.Id = _nextId++;
-                    _games.Add(newGame);
+
+                    // Give a unique ID to the new game 
+                    int newId = 1;
+                    while (gamesList.Any(g => g.Id == newId))
+                        newId++;
+                    newGame.Id = newId;
+
+                    gamesList.Add(newGame);
 
                     return new OkObjectResult(newGame);
 
@@ -74,7 +86,7 @@ public class game_api
                     if (id == 0 && int.TryParse(req.Query["id"], out var queryId))
                         id = queryId;
 
-                    var existingGame = _games.FirstOrDefault(g => g.Id == updatedGame.Id);
+                    var existingGame = gamesList.FirstOrDefault(g => g.Id == updatedGame.Id);
 
                     if (existingGame == null)
                         return new NotFoundObjectResult("Game could not be found");
@@ -100,12 +112,12 @@ public class game_api
                     {
                         return new BadRequestObjectResult("Missing or invalid id");
                     }
-                    var gameToDelete = _games.FirstOrDefault(g => g.Id == id);
+                    var gameToDelete = gamesList.FirstOrDefault(g => g.Id == id);
 
                     if (gameToDelete == null)
                         return new NotFoundObjectResult($"Game with id \"{id}\" not found");
 
-                    _games.Remove(gameToDelete);
+                    gamesList.Remove(gameToDelete);
 
 
                     return new OkObjectResult($"Game with id {id} deleted");
