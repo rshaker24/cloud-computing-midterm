@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
 
+
 namespace Company.Function;
 
 public class Game_api
@@ -25,7 +26,7 @@ public class Game_api
 
     private bool IsAuthorized(HttpRequest req)
     {
-        if (!req.Headers.TryGetValue("x-api-key", out var key)) return false;
+        if (!req.Headers.TryGetValue("game_api_key", out var key)) return false;
         return key == _apiKey;
     }
 
@@ -48,7 +49,16 @@ public class Game_api
         {
 
             case "GET": //get list of all games
+                if (req.Query.TryGetValue("id", out var idValues) && int.TryParse(idValues.First(), out var id))
+                {
+                    var game = gamesList.FirstOrDefault(g => g.Id == id);
+                    if (game == null)
+                        return new NotFoundObjectResult($"Game with ID \"{id}\" not found.");
+
+                    return new OkObjectResult(game);
+                }
                 return new OkObjectResult(gamesList);
+
 
             case "POST": //create a new game
                 {
@@ -59,6 +69,9 @@ public class Game_api
                     var newGame = JsonSerializer.Deserialize<GameModel>(body);
                     if (newGame == null)
                         return new BadRequestObjectResult("Invalid game data");
+
+                    if (string.IsNullOrWhiteSpace(newGame.Title))
+                        return new BadRequestObjectResult("Title is required.");
 
                     // Give a unique ID to the new game 
                     int newId = 1;
@@ -73,8 +86,7 @@ public class Game_api
                 }
             case "PUT":
                 {
-                    //gather new game data
-                    //replace existing game data
+                    //gather updated game data
                     using var reader = new StreamReader(req.Body);
                     var body = await reader.ReadToEndAsync();
 
@@ -82,14 +94,17 @@ public class Game_api
                     if (updatedGame == null)
                         return new BadRequestObjectResult("Invalid game id");
 
-                    int id = updatedGame.Id;
+                    // Find the game to update
+                    id = updatedGame.Id;
                     if (id == 0 && int.TryParse(req.Query["id"], out var queryId))
                         id = queryId;
 
-                    var existingGame = gamesList.FirstOrDefault(g => g.Id == updatedGame.Id);
+                    if (id == 0)
+                        return new BadRequestObjectResult("Missing game ID in JSON or query string.");
 
+                    var existingGame = gamesList.FirstOrDefault(g => g.Id == id);
                     if (existingGame == null)
-                        return new NotFoundObjectResult("Game could not be found");
+                        return new NotFoundObjectResult($"Game with id \"{id}\" not found");
 
                     // Update fields if they are provided in the request
                     if (!string.IsNullOrEmpty(updatedGame.Title))
@@ -108,9 +123,10 @@ public class Game_api
                 }
             case "DELETE": //delete by providing an id
                 {
-                    if (!req.Query.TryGetValue("id", out var idValues) || !int.TryParse(idValues.First(), out var id))
+                    //get id from query string
+                    if (!req.Query.TryGetValue("id", out idValues) || !int.TryParse(idValues.First(), out id))
                     {
-                        return new BadRequestObjectResult("Missing or invalid id");
+                        return new BadRequestObjectResult("Invalid or missing id");
                     }
                     var gameToDelete = gamesList.FirstOrDefault(g => g.Id == id);
 
@@ -120,10 +136,9 @@ public class Game_api
                     gamesList.Remove(gameToDelete);
 
 
-                    return new OkObjectResult($"Game with id {id} deleted");
+                    return new OkObjectResult($"Game with id \"{id}\" deleted");
                 }
         }
-
-        return new OkObjectResult("Welcome to Game API!");
+        return new OkObjectResult("Please use GET, POST, PUT or DELETE methods");
     }
 }
