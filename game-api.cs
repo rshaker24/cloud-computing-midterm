@@ -48,7 +48,7 @@ public class Game_api
         switch (req.Method)
         {
 
-            case "GET": //get list of all games
+            case "GET": // return all game entries or a specific game entry by id
                 if (req.Query.TryGetValue("id", out var idValues) && int.TryParse(idValues.First(), out var id))
                 {
                     var game = gamesList.FirstOrDefault(g => g.Id == id);
@@ -60,7 +60,7 @@ public class Game_api
                 return new OkObjectResult(gamesList);
 
 
-            case "POST": //create a new game
+            case "POST": //create a new game entry
                 {
                     //Read JSON data
                     using var reader = new StreamReader(req.Body);
@@ -84,7 +84,7 @@ public class Game_api
                     return new OkObjectResult(newGame);
 
                 }
-            case "PUT":
+            case "PUT": //update a game entry
                 {
                     //gather updated game data
                     using var reader = new StreamReader(req.Body);
@@ -121,7 +121,7 @@ public class Game_api
 
                     return new OkObjectResult(existingGame);
                 }
-            case "DELETE": //delete by providing an id
+            case "DELETE": //delete a game entry
                 {
                     //get id from query string
                     if (!req.Query.TryGetValue("id", out idValues) || !int.TryParse(idValues.First(), out id))
