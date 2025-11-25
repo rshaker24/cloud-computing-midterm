@@ -1,10 +1,16 @@
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.HttpResults;
-using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Azure.Functions.Worker.Http;
+using System.Net;
+using System.IO;
+using System.Linq;
+using Microsoft.AspNetCore.WebUtilities;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
 using Microsoft.Extensions.Configuration;
+using Azure.Identity;
+using Azure.Security.KeyVault.Secrets;
+using Microsoft.Data.SqlClient;
 
 
 namespace Company.Function;
@@ -12,133 +18,293 @@ namespace Company.Function;
 public class Game_api
 {
     private readonly ILogger<Game_api> _logger;
-
-    private static readonly List<GameModel> gamesList = new();
+    private readonly string _connectionString;
     private readonly string _apiKey;
+
+
 
 
     public Game_api(ILogger<Game_api> logger, IConfiguration config)
     {
         _logger = logger;
-        _apiKey = config["API_KEY"] ?? throw new Exception("API_KEY is missing");
+
+        _connectionString = Environment.GetEnvironmentVariable("SqlConnectionString")
+            ?? throw new Exception("SQL Connection string missing from configuration.");
+
+        bool useKeyVault = bool.TryParse(config["USE_KEY_VAULT"], out var flag) && flag;
+
+        if (useKeyVault)
+        {
+            string vaultUrl = config["KEY_VAULT_URL"]?.Trim()
+               ?? throw new Exception("KEY_VAULT_URL is missing");
+
+            if (string.IsNullOrWhiteSpace(vaultUrl))
+                throw new Exception("KEY_VAULT_URL is missing");
+
+            try
+            {
+                // Load from Key Vault
+                var credential = new DefaultAzureCredential();
+
+                var client = new SecretClient(new Uri(vaultUrl), credential);
+
+                // SecretClient.GetSecret returns a Response<KeyVaultSecret>
+                var secretResponse = client.GetSecret("ApiKey");
+                _apiKey = secretResponse.Value.Value;
+
+                _logger.LogInformation("API Key loaded from Key Vault.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to load API key from Key Vault. Attempting local fallback.");
+                // fallback to local setting if present (guard config for null)
+                var fallbackApiKey = config?.GetValue<string>("API_KEY");
+
+                if (string.IsNullOrWhiteSpace(fallbackApiKey))
+                {
+                    throw new Exception("Unable to load API key from Key Vault and no local API_KEY found.", ex);
+                }
+
+                _apiKey = fallbackApiKey;
+                _logger.LogInformation("API Key loaded from local settings (fallback).");
+            }
+        }
+        else
+        {
+            // Load from local settings
+            _apiKey = config["API_KEY"]
+                ?? throw new Exception("API_KEY missing from local settings.");
+
+            _logger.LogInformation("API Key loaded from local settings.");
+        }
+
+
     }
 
 
-    private bool IsAuthorized(HttpRequest req)
+    private bool IsAuthorized(HttpRequestData req)
     {
-        if (!req.Headers.TryGetValue("game_api_key", out var key)) return false;
-        return key == _apiKey;
+        if (!req.Headers.TryGetValues("x-api-key", out var values)) return false;
+        return values.FirstOrDefault() == _apiKey;
+    }
+
+    private async Task<SqlConnection> GetSqlConnectionAsync()
+    {
+        var conn = new SqlConnection(_connectionString);
+
+        // If the connection string does not contain user/password, assume AAD auth and set AccessToken.
+        if (!(_connectionString?.Contains("Password=", StringComparison.OrdinalIgnoreCase) == true
+            || _connectionString?.Contains("User ID=", StringComparison.OrdinalIgnoreCase) == true))
+        {
+            var token = (await new DefaultAzureCredential().GetTokenAsync(
+                new Azure.Core.TokenRequestContext(new[] { "https://database.windows.net/.default" })
+            )).Token;
+
+            conn.AccessToken = token;
+        }
+
+        await conn.OpenAsync();
+        return conn;
     }
 
 
     [Function("game_api")]
-    public async Task<IActionResult> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", "put", "delete")] HttpRequest req)
+    public async Task<HttpResponseData> Run([HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", "put", "delete")] HttpRequestData req, FunctionContext context)
     {
-        _logger.LogInformation("C# HTTP trigger function processed a request.");
-
-        // Check for API key
-        if (!IsAuthorized(req))
+        try
         {
-            return new ObjectResult(new { error = "API Key is Invalid or missing" })
+            _logger.LogInformation("C# HTTP trigger function processed a request.");
+
+            // Check for API key
+            if (!IsAuthorized(req))
             {
-                StatusCode = StatusCodes.Status401Unauthorized
-            };
-        }
+                var unauthorized = req.CreateResponse(HttpStatusCode.Unauthorized);
+                unauthorized.Headers.Add("Content-Type", "application/json");
+                await unauthorized.WriteStringAsync(JsonSerializer.Serialize(new { error = "API Key is Invalid or missing" }));
+                return unauthorized;
+            }
 
-        switch (req.Method)
-        {
+            async Task<HttpResponseData> JsonResponseAsync(HttpRequestData request, object obj, HttpStatusCode status = HttpStatusCode.OK)
+            {
+                var res = request.CreateResponse(status);
+                res.Headers.Add("Content-Type", "application/json");
+                await res.WriteStringAsync(JsonSerializer.Serialize(obj));
+                return res;
+            }
 
-            case "GET": // return all game entries or a specific game entry by id
-                if (req.Query.TryGetValue("id", out var idValues) && int.TryParse(idValues.First(), out var id))
-                {
-                    var game = gamesList.FirstOrDefault(g => g.Id == id);
-                    if (game == null)
-                        return new NotFoundObjectResult($"Game with ID \"{id}\" not found.");
-
-                    return new OkObjectResult(game);
-                }
-                return new OkObjectResult(gamesList);
-
-
-            case "POST": //create a new game entry
-                {
-                    //Read JSON data
-                    using var reader = new StreamReader(req.Body);
-                    var body = await reader.ReadToEndAsync();
-
-                    var newGame = JsonSerializer.Deserialize<GameModel>(body);
-                    if (newGame == null)
-                        return new BadRequestObjectResult("Invalid game data");
-
-                    if (string.IsNullOrWhiteSpace(newGame.Title))
-                        return new BadRequestObjectResult("Title is required.");
-
-                    // Give a unique ID to the new game 
-                    int newId = 1;
-                    while (gamesList.Any(g => g.Id == newId))
-                        newId++;
-                    newGame.Id = newId;
-
-                    gamesList.Add(newGame);
-
-                    return new OkObjectResult(newGame);
-
-                }
-            case "PUT": //update a game entry
-                {
-                    //gather updated game data
-                    using var reader = new StreamReader(req.Body);
-                    var body = await reader.ReadToEndAsync();
-
-                    var updatedGame = JsonSerializer.Deserialize<GameModel>(body);
-                    if (updatedGame == null)
-                        return new BadRequestObjectResult("Invalid game id");
-
-                    // Find the game to update
-                    id = updatedGame.Id;
-                    if (id == 0 && int.TryParse(req.Query["id"], out var queryId))
-                        id = queryId;
-
-                    if (id == 0)
-                        return new BadRequestObjectResult("Missing game ID in JSON or query string.");
-
-                    var existingGame = gamesList.FirstOrDefault(g => g.Id == id);
-                    if (existingGame == null)
-                        return new NotFoundObjectResult($"Game with id \"{id}\" not found");
-
-                    // Update fields if they are provided in the request
-                    if (!string.IsNullOrEmpty(updatedGame.Title))
-                        existingGame.Title = updatedGame.Title;
-
-                    if (!string.IsNullOrEmpty(updatedGame.Developer))
-                        existingGame.Developer = updatedGame.Developer;
-
-                    if (!string.IsNullOrEmpty(updatedGame.Genre))
-                        existingGame.Genre = updatedGame.Genre;
-
-                    if (updatedGame.ReleaseYear.HasValue)
-                        existingGame.ReleaseYear = updatedGame.ReleaseYear.Value;
-
-                    return new OkObjectResult(existingGame);
-                }
-            case "DELETE": //delete a game entry
-                {
-                    //get id from query string
-                    if (!req.Query.TryGetValue("id", out idValues) || !int.TryParse(idValues.First(), out id))
+            switch (req.Method?.ToUpperInvariant())
+            {
+                case "GET":
+                    using (var conn = await GetSqlConnectionAsync())
                     {
-                        return new BadRequestObjectResult("Invalid or missing id");
+                        var queryMap = QueryHelpers.ParseQuery(req.Url.Query);
+                        var idParam = queryMap.TryGetValue("id", out var idVals) ? idVals.FirstOrDefault() : null;
+
+                        if (!string.IsNullOrEmpty(idParam) && int.TryParse(idParam, out int id))
+                        {
+                            var cmd = new SqlCommand(
+                                "SELECT Id, Title, Developer, Genre, ReleaseYear FROM Games WHERE Id = @Id",
+                                conn
+                            );
+                            cmd.Parameters.AddWithValue("@Id", id);
+
+                            using var reader = await cmd.ExecuteReaderAsync();
+
+                            if (!reader.Read())
+                                return await JsonResponseAsync(req, new { error = $"Game with ID {id} not found" }, HttpStatusCode.NotFound);
+
+                            var game = new GameModel
+                            {
+                                Id = reader.GetInt32(0),
+                                Title = reader.GetString(1),
+                                Developer = reader.IsDBNull(2) ? null : reader.GetString(2),
+                                Genre = reader.IsDBNull(3) ? null : reader.GetString(3),
+                                ReleaseYear = reader.IsDBNull(4) ? null : reader.GetInt32(4)
+                            };
+
+                            return await JsonResponseAsync(req, game);
+                        }
+
+                        var listCmd = new SqlCommand(
+                            "SELECT Id, Title, Developer, Genre, ReleaseYear FROM Games",
+                            conn
+                        );
+
+                        var listReader = await listCmd.ExecuteReaderAsync();
+                        var games = new List<GameModel>();
+
+                        while (await listReader.ReadAsync())
+                        {
+                            games.Add(new GameModel
+                            {
+                                Id = listReader.GetInt32(0),
+                                Title = listReader.GetString(1),
+                                Developer = listReader.IsDBNull(2) ? null : listReader.GetString(2),
+                                Genre = listReader.IsDBNull(3) ? null : listReader.GetString(3),
+                                ReleaseYear = listReader.IsDBNull(4) ? null : listReader.GetInt32(4)
+                            });
+                        }
+
+                        return await JsonResponseAsync(req, games);
                     }
-                    var gameToDelete = gamesList.FirstOrDefault(g => g.Id == id);
 
-                    if (gameToDelete == null)
-                        return new NotFoundObjectResult($"Game with id \"{id}\" not found");
+                case "POST":
+                    {
+                        using var reader = new StreamReader(req.Body);
+                        var body = await reader.ReadToEndAsync();
 
-                    gamesList.Remove(gameToDelete);
+                        var newGame = JsonSerializer.Deserialize<GameModel>(body);
+                        if (newGame == null)
+                            return await JsonResponseAsync(req, new { error = "Invalid JSON data." }, HttpStatusCode.BadRequest);
 
+                        if (string.IsNullOrWhiteSpace(newGame.Title))
+                            return await JsonResponseAsync(req, new { error = "Title is required." }, HttpStatusCode.BadRequest);
 
-                    return new OkObjectResult($"Game with id \"{id}\" deleted");
-                }
+                        try
+                        {
+                            await using var conn = await GetSqlConnectionAsync();
+
+                            string sql = @"
+                        INSERT INTO Games (Title, Developer, Genre, ReleaseYear)
+                        VALUES (@Title, @Developer, @Genre, @ReleaseYear);
+                        SELECT SCOPE_IDENTITY();
+                    ";
+
+                            await using var cmd = new SqlCommand(sql, conn);
+
+                            cmd.Parameters.AddWithValue("@Title", newGame.Title);
+                            cmd.Parameters.AddWithValue("@Developer", newGame.Developer ?? (object)DBNull.Value);
+                            cmd.Parameters.AddWithValue("@Genre", newGame.Genre ?? (object)DBNull.Value);
+                            cmd.Parameters.AddWithValue("@ReleaseYear", newGame.ReleaseYear ?? (object)DBNull.Value);
+
+                            var result = await cmd.ExecuteScalarAsync();
+
+                            if (result == null || result == DBNull.Value)
+                                throw new Exception("Database did not return a new ID.");
+
+                            newGame.Id = Convert.ToInt32(result);
+
+                            return await JsonResponseAsync(req, newGame);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "SQL insert failed.");
+                            return await JsonResponseAsync(req, new { error = ex.Message }, HttpStatusCode.InternalServerError);
+                        }
+                    }
+
+                case "PUT":
+                    {
+                        using var reader = new StreamReader(req.Body);
+                        var body = await reader.ReadToEndAsync();
+                        var game = JsonSerializer.Deserialize<GameModel>(body);
+
+                        if (game == null || game.Id == 0)
+                            return await JsonResponseAsync(req, new { error = "Missing game Id" }, HttpStatusCode.BadRequest);
+
+                        using var conn = await GetSqlConnectionAsync();
+
+                        var cmd = new SqlCommand(
+                            @"UPDATE Games 
+                          SET Title=@Title, Developer=@Dev, Genre=@Genre, ReleaseYear=@Year
+                          WHERE Id=@Id",
+                            conn
+                        );
+
+                        cmd.Parameters.AddWithValue("@Id", game.Id);
+                        cmd.Parameters.AddWithValue("@Title", game.Title ?? (object)DBNull.Value);
+                        cmd.Parameters.AddWithValue("@Dev", (object?)game.Developer ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@Genre", (object?)game.Genre ?? DBNull.Value);
+                        cmd.Parameters.AddWithValue("@Year", (object?)game.ReleaseYear ?? DBNull.Value);
+
+                        int rows = await cmd.ExecuteNonQueryAsync();
+
+                        if (rows == 0)
+                            return await JsonResponseAsync(req, new { error = $"Game with ID {game.Id} not found" }, HttpStatusCode.NotFound);
+
+                        return await JsonResponseAsync(req, game);
+                    }
+
+                case "DELETE":
+                    {
+                        var queryMap = QueryHelpers.ParseQuery(req.Url.Query);
+                        var idParam = queryMap.TryGetValue("id", out var idVals) ? idVals.FirstOrDefault() : null;
+
+                        if (string.IsNullOrEmpty(idParam) || !int.TryParse(idParam, out int deleteId))
+                            return await JsonResponseAsync(req, new { error = "Missing or invalid id" }, HttpStatusCode.BadRequest);
+
+                        using (var conn = await GetSqlConnectionAsync())
+                        {
+                            var cmd = new SqlCommand("DELETE FROM Games WHERE Id = @Id", conn);
+                            cmd.Parameters.AddWithValue("@Id", deleteId);
+
+                            int rows = await cmd.ExecuteNonQueryAsync();
+
+                            if (rows == 0)
+                                return await JsonResponseAsync(req, new { error = $"No game with ID {deleteId}" }, HttpStatusCode.NotFound);
+
+                            return await JsonResponseAsync(req, new { message = $"Deleted game with ID {deleteId}" });
+                        }
+                    }
+
+                default:
+                    return await JsonResponseAsync(req, new { error = "Use GET, POST, PUT, or DELETE" }, HttpStatusCode.BadRequest);
+            }
         }
-        return new OkObjectResult("Please use GET, POST, PUT or DELETE methods");
+        catch (Exception ex)
+        {
+            // Log full exception message and stack trace
+            _logger.LogError(ex, "Unhandled exception in Run: {Message} {StackTrace}", ex.Message, ex.StackTrace);
+
+            var res = req.CreateResponse(HttpStatusCode.InternalServerError);
+            res.Headers.Add("Content-Type", "application/json");
+            await res.WriteStringAsync(JsonSerializer.Serialize(new
+            {
+                error = "Internal Server Error",
+                detail = ex.Message
+            }));
+            return res;
+        }
+
     }
 }
