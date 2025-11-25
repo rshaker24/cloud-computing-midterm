@@ -11,6 +11,7 @@ using Microsoft.Extensions.Configuration;
 using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
 using Microsoft.Data.SqlClient;
+using Azure;
 
 
 namespace Company.Function;
@@ -31,51 +32,26 @@ public class Game_api
         _connectionString = Environment.GetEnvironmentVariable("SqlConnectionString")
             ?? throw new Exception("SQL Connection string missing from configuration.");
 
-        bool useKeyVault = bool.TryParse(config["USE_KEY_VAULT"], out var flag) && flag;
+        // Always load API key from Key Vault. No local env fallback per project requirement.
+        var vaultUrl = config?.GetValue<string>("KEY_VAULT_URL")?.Trim();
+        if (string.IsNullOrWhiteSpace(vaultUrl))
+            throw new Exception("KEY_VAULT_URL is missing from configuration. The API key must be retrieved from Key Vault.");
 
-        if (useKeyVault)
+        try
         {
-            string vaultUrl = config["KEY_VAULT_URL"]?.Trim()
-               ?? throw new Exception("KEY_VAULT_URL is missing");
+            var credential = new DefaultAzureCredential();
+            var client = new SecretClient(new Uri(vaultUrl), credential);
 
-            if (string.IsNullOrWhiteSpace(vaultUrl))
-                throw new Exception("KEY_VAULT_URL is missing");
+            // Use the synchronous call here (keeps startup behavior deterministic).
+            Response<KeyVaultSecret> secretResponse = client.GetSecret("ApiKey");
+            _apiKey = secretResponse?.Value?.Value ?? throw new Exception("ApiKey secret in Key Vault is empty.");
 
-            try
-            {
-                // Load from Key Vault
-                var credential = new DefaultAzureCredential();
-
-                var client = new SecretClient(new Uri(vaultUrl), credential);
-
-                // SecretClient.GetSecret returns a Response<KeyVaultSecret>
-                var secretResponse = client.GetSecret("ApiKey");
-                _apiKey = secretResponse.Value.Value;
-
-                _logger.LogInformation("API Key loaded from Key Vault.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to load API key from Key Vault. Attempting local fallback.");
-                // fallback to local setting if present (guard config for null)
-                var fallbackApiKey = config?.GetValue<string>("API_KEY");
-
-                if (string.IsNullOrWhiteSpace(fallbackApiKey))
-                {
-                    throw new Exception("Unable to load API key from Key Vault and no local API_KEY found.", ex);
-                }
-
-                _apiKey = fallbackApiKey;
-                _logger.LogInformation("API Key loaded from local settings (fallback).");
-            }
+            _logger.LogInformation("API Key loaded from Key Vault.");
         }
-        else
+        catch (Exception ex)
         {
-            // Load from local settings
-            _apiKey = config["API_KEY"]
-                ?? throw new Exception("API_KEY missing from local settings.");
-
-            _logger.LogInformation("API Key loaded from local settings.");
+            _logger.LogError(ex, "Failed to load API key from Key Vault.");
+            throw new Exception("Failed to obtain API key from Key Vault. Ensure KEY_VAULT_URL is correct and the identity has access to the secret.", ex);
         }
 
 
