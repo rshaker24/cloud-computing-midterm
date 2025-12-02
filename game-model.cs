@@ -5,5 +5,6 @@ public class GameModel
     public string? Developer { get; set; }
     public string? Genre { get; set; }
     public int? ReleaseYear { get; set; }
+    public bool? IsRetro { get; set; }
 
 }
