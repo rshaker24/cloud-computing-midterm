@@ -1,3 +1,3 @@
 This is a lightweight REST API that stores and tracks “games” in an SQL database, allowing CRUD functions to be performed against it. A “game” object consists of “Id”, “Title”, “Genre”, “Developer”, “ReleaseYear”, and “IsRetro” attributes. Users can perform GET, POST, PUT, and DELETE, and PATCH requests to interact with the games repository. The API is secured using an API key that is stored in a Key Vault, accessed by a Managed Identity. This was developed using Azure Functions in C# with Visual Studio Code and tested with the ThunderClient extension.
 
-Created By Ryan Shaker for CS-432 Clouding Computing at Sacred Heart University
+Created By Ryan Shaker for CS-432 Cloud Computing at Sacred Heart University
