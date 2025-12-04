@@ -35,7 +35,7 @@ public class Game_api
         _connectionString = Environment.GetEnvironmentVariable("SqlConnectionString")
             ?? throw new Exception("SQL Connection string missing from configuration.");
 
-        // Always load API key from Key Vault. No local env fallback per project requirement.
+
         var vaultUrl = config?.GetValue<string>("KEY_VAULT_URL")?.Trim();
         if (string.IsNullOrWhiteSpace(vaultUrl))
             throw new Exception("KEY_VAULT_URL is missing from configuration. The API key must be retrieved from Key Vault.");
@@ -71,7 +71,7 @@ public class Game_api
     {
         var conn = new SqlConnection(_connectionString);
 
-        // If the connection string does not contain user/password, assume AAD auth and set AccessToken.
+
         if (!(_connectionString?.Contains("Password=", StringComparison.OrdinalIgnoreCase) == true
             || _connectionString?.Contains("User ID=", StringComparison.OrdinalIgnoreCase) == true))
         {
@@ -135,8 +135,8 @@ public class Game_api
                             // 1. Extract Release Year first
                             int? releaseYear = reader.IsDBNull(4) ? (int?)null : reader.GetInt32(4);
 
-                            // 2. Determine IsRetro (Using the same fallback logic as your List loop)
-                            bool? isRetro; // Using bool? to match your Model
+                            // 2. Determine IsRetro
+                            bool? isRetro;
 
                             if (!reader.IsDBNull(5))
                             {
@@ -223,31 +223,51 @@ public class Game_api
                         {
                             await using var conn = await GetSqlConnectionAsync();
 
-                            string sql = @"
-                            INSERT INTO Games (Title, Developer, Genre, ReleaseYear)
-                            VALUES (@Title, @Developer, @Genre, @ReleaseYear);
-                            SELECT SCOPE_IDENTITY();
-                            ";
 
-                            await using var cmd = new SqlCommand(sql, conn);
+                            string idCalcSql = @"
+                                SELECT ISNULL(
+                                (SELECT MIN(t.RN)
+                                    FROM (
+                                    SELECT ROW_NUMBER() OVER (ORDER BY Id) RN, Id
+                                    FROM Games
+                                    ) t
+                                    WHERE t.Id <> t.RN
+                                ), (SELECT ISNULL(MAX(Id),0)+1 FROM Games)
+                                )";
 
-                            cmd.Parameters.AddWithValue("@Title", newGame.Title);
-                            cmd.Parameters.AddWithValue("@Developer", newGame.Developer ?? (object)DBNull.Value);
-                            cmd.Parameters.AddWithValue("@Genre", newGame.Genre ?? (object)DBNull.Value);
-                            cmd.Parameters.AddWithValue("@ReleaseYear", newGame.ReleaseYear ?? (object)DBNull.Value);
+                            using var idCmd = new SqlCommand(idCalcSql, conn);
+                            var idResult = await idCmd.ExecuteScalarAsync();
+                            int newId = Convert.ToInt32(idResult);
 
-                            var result = await cmd.ExecuteScalarAsync();
 
-                            if (result == null || result == DBNull.Value)
-                                throw new Exception("Database did not return a new ID.");
+                            string insertSql = @"
+                                SET IDENTITY_INSERT Games ON;
+                                INSERT INTO Games (Id, Title, Developer, Genre, ReleaseYear)
+                                VALUES (@Id, @Title, @Developer, @Genre, @ReleaseYear);
+                                SET IDENTITY_INSERT Games OFF;
+                                ";
 
-                            newGame.Id = Convert.ToInt32(result);
+                            using var insertCmd = new SqlCommand(insertSql, conn);
+                            insertCmd.Parameters.AddWithValue("@Id", newId);
+                            insertCmd.Parameters.AddWithValue("@Title", newGame.Title);
+                            insertCmd.Parameters.AddWithValue("@Developer", newGame.Developer ?? (object)DBNull.Value);
+                            insertCmd.Parameters.AddWithValue("@Genre", newGame.Genre ?? (object)DBNull.Value);
+                            insertCmd.Parameters.AddWithValue("@ReleaseYear", newGame.ReleaseYear ?? (object)DBNull.Value);
+
+                            await insertCmd.ExecuteNonQueryAsync();
+
+                            newGame.Id = newId;
 
                             return await JsonResponseAsync(req, newGame);
                         }
+                        catch (SqlException sqlEx)
+                        {
+                            _logger.LogError(sqlEx, "SQL insert failed.");
+                            return await JsonResponseAsync(req, new { error = sqlEx.Message }, HttpStatusCode.InternalServerError);
+                        }
                         catch (Exception ex)
                         {
-                            _logger.LogError(ex, "SQL insert failed.");
+                            _logger.LogError(ex, "Insert failed.");
                             return await JsonResponseAsync(req, new { error = ex.Message }, HttpStatusCode.InternalServerError);
                         }
                     }
@@ -262,11 +282,11 @@ public class Game_api
 
                         using var conn = await GetSqlConnectionAsync();
 
-                        // STEP 1: READ EXISTING DATA
-                        // We fetch the current values so we can merge them in C#
+
+                        // fetch the current values so we can merge them in C#
                         var getCmd = new SqlCommand("SELECT Title, Developer, Genre, ReleaseYear, IsRetro FROM Games WHERE Id = @Id", conn);
                         getCmd.Parameters.AddWithValue("@Id", incomingGame.Id);
-                        
+
                         // Variables to hold current DB state
                         string currentTitle;
                         string? currentDev, currentGenre;
@@ -283,26 +303,21 @@ public class Game_api
                             currentGenre = dbReader.IsDBNull(2) ? null : dbReader.GetString(2);
                             currentYear = dbReader.IsDBNull(3) ? (int?)null : dbReader.GetInt32(3);
                             currentRetro = dbReader.IsDBNull(4) ? (bool?)null : Convert.ToBoolean(dbReader["IsRetro"]);
-                        } 
-                        // Reader closes here automatically
+                        }
 
-                        // STEP 2: MERGE IN C#
-                        // Logic: "If incoming has a value, use it. Otherwise, keep the old DB value."
                         var finalTitle = incomingGame.Title ?? currentTitle;
                         var finalDev = incomingGame.Developer ?? currentDev;
                         var finalGenre = incomingGame.Genre ?? currentGenre;
                         var finalYear = incomingGame.ReleaseYear ?? currentYear;
                         var finalRetro = incomingGame.IsRetro ?? currentRetro;
 
-                        // STEP 3: UPDATE WITH MERGED VALUES
                         var updateCmd = new SqlCommand(
                             @"UPDATE Games 
                             SET Title=@Title, Developer=@Dev, Genre=@Genre, ReleaseYear=@Year, IsRetro=@Retro
                             WHERE Id=@Id", conn);
 
                         updateCmd.Parameters.AddWithValue("@Id", incomingGame.Id);
-                        
-                        // The Fix for CS0019: We cast everything to (object) so '?? DBNull.Value' works correctly.
+
                         updateCmd.Parameters.AddWithValue("@Title", (object?)finalTitle ?? DBNull.Value);
                         updateCmd.Parameters.AddWithValue("@Dev", (object?)finalDev ?? DBNull.Value);
                         updateCmd.Parameters.AddWithValue("@Genre", (object?)finalGenre ?? DBNull.Value);
@@ -311,9 +326,8 @@ public class Game_api
 
                         await updateCmd.ExecuteNonQueryAsync();
 
-                        // STEP 4: UPDATE RESPONSE OBJECT
-                        // We update the object we are sending back so Postman shows the FULL, merged data.
-                        incomingGame.Title = finalTitle ?? string.Empty;;
+                        // UPDATE RESPONSE OBJECT
+                        incomingGame.Title = finalTitle ?? string.Empty; ;
                         incomingGame.Developer = finalDev;
                         incomingGame.Genre = finalGenre;
                         incomingGame.ReleaseYear = finalYear;
@@ -344,7 +358,7 @@ public class Game_api
                     }
                 case "PATCH":
                     {
-                        // PATCH /api/game_api/validate: set IsRetro = 1 for games older than 25 years
+                        // set IsRetro = 1 for games older than 25 years
                         var path = (req.Url.AbsolutePath ?? string.Empty).TrimEnd('/').ToLowerInvariant();
                         if (!path.EndsWith("/validate"))
                         {
@@ -371,7 +385,7 @@ public class Game_api
                             var eventProps = new Dictionary<string, string>
                             {
                                 { "TriggerSource", "API" },
-                                { "ValidationType", "RetroArchival" } // or "IsClassic" if you kept that
+                                { "ValidationType", "RetroArchival" }
                             };
 
                             var eventMetrics = new Dictionary<string, double>
